@@ -1,5 +1,286 @@
-local p = workspace["ОТКРОЙ!"]
-p["Распакуй в ServerStorage"].Parent = game.ServerStorage
-p["Распакуй в ServerScriptService"].Parent = game.ServerScriptService
-p["Распакуй в StarterPlayerScripts"].Parent = game.StarterPlayer.StarterPlayerScripts
-p:Destroy()
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local DataStoreService = game:GetService("DataStoreService")
+
+local CheatStore = DataStoreService:GetDataStore("CheatWarnings")
+
+local WEBHOOK_URL = ""
+
+local WHITELISTED_IDS = {
+	[123456789] = true,
+	[987654321] = true,
+}
+
+local MAX_WALKSPEED     = 18
+local MAX_JUMPPOWER     = 50
+local MAX_JUMPHEIGHT    = 7.5
+local SPEED_BUFFER      = 6
+
+local MAX_TELEPORT_DIST     = 50
+local MAX_NOCLIP_ATTEMPTS   = 3
+
+local MAX_AIR_TIME          = 2.5
+local MAX_UPWARD_VELOCITY   = 20
+local AIR_CHECK_INTERVAL    = 0.5
+local GROUND_RAY_DISTANCE   = 12
+
+local MAX_HEALTH_REGEN_PER_SEC = 15
+local REGEN_VIOLATIONS_LIMIT   = 3
+
+local KICK_MESSAGE = "[Anti-Cheat]: Anomalous activity detected. You have been kicked for exploiting."
+
+local function isWhitelisted(player)
+	return WHITELISTED_IDS[player.UserId] == true
+end
+
+local function sendWebhook(player, reason)
+	if WEBHOOK_URL == "" then return end
+	local data = {
+		embeds = {{
+			title = "Anti-Cheat Detection",
+			description = player.Name .. " был кикнут",
+			color = 16711680,
+			fields = {
+				{ name = "Player", value = player.Name, inline = true },
+				{ name = "UserId", value = tostring(player.UserId), inline = true },
+				{ name = "Reason", value = reason, inline = false },
+			},
+		}},
+	}
+	pcall(function()
+		HttpService:PostAsync(WEBHOOK_URL, HttpService:JSONEncode(data), Enum.HttpContentType.ApplicationJson)
+	end)
+end
+
+local function punishPlayer(player, reason)
+	pcall(function()
+		CheatStore:SetAsync(player.UserId, true)
+	end)
+	sendWebhook(player, reason)
+	player:Kick(reason)
+end
+
+Players.PlayerAdded:Connect(function(player)
+	task.spawn(function()
+		local cheatedBefore = false
+		pcall(function()
+			cheatedBefore = CheatStore:GetAsync(player.UserId)
+		end)
+
+		if cheatedBefore then
+			print("[AntiCheat] " .. player.Name .. " ранее уже был отмечен как читер.")
+			pcall(function()
+				CheatStore:RemoveAsync(player.UserId)
+			end)
+		end
+	end)
+end)
+
+local function watch(player, character)
+	if isWhitelisted(player) then
+		print("[AntiCheat] " .. player.Name .. " в whitelist, проверки пропущены.")
+		return
+	end
+
+	local humanoid = character:WaitForChild("Humanoid", 10)
+	local root = character:WaitForChild("HumanoidRootPart", 10)
+	if not humanoid or not root then return end
+
+	local function enforceStats()
+		if humanoid.WalkSpeed > MAX_WALKSPEED then
+			humanoid.WalkSpeed = MAX_WALKSPEED
+		end
+		if humanoid.UseJumpPower then
+			if humanoid.JumpPower > MAX_JUMPPOWER then
+				humanoid.JumpPower = MAX_JUMPPOWER
+			end
+		else
+			if humanoid.JumpHeight > MAX_JUMPHEIGHT then
+				humanoid.JumpHeight = MAX_JUMPHEIGHT
+			end
+		end
+	end
+	enforceStats()
+
+	local function checkStatsAndPunish()
+		if humanoid.WalkSpeed > MAX_WALKSPEED then
+			punishPlayer(player, KICK_MESSAGE .. " (WalkSpeed)")
+			return true
+		end
+		if humanoid.UseJumpPower and humanoid.JumpPower > MAX_JUMPPOWER then
+			punishPlayer(player, KICK_MESSAGE .. " (JumpPower)")
+			return true
+		end
+		if not humanoid.UseJumpPower and humanoid.JumpHeight > MAX_JUMPHEIGHT then
+			punishPlayer(player, KICK_MESSAGE .. " (JumpHeight)")
+			return true
+		end
+		return false
+	end
+
+	local statConns = {
+		humanoid:GetPropertyChangedSignal("WalkSpeed"):Connect(checkStatsAndPunish),
+		humanoid:GetPropertyChangedSignal("JumpPower"):Connect(checkStatsAndPunish),
+		humanoid:GetPropertyChangedSignal("JumpHeight"):Connect(checkStatsAndPunish),
+	}
+
+	local lastPos = root.Position
+	local lastTime = os.clock()
+	local noclipCount = 0
+
+	local heartbeatConn
+	heartbeatConn = RunService.Heartbeat:Connect(function()
+		if not root.Parent or humanoid.Health <= 0 then
+			lastPos = root.Position
+			lastTime = os.clock()
+			return
+		end
+
+		local now = os.clock()
+		local dt = now - lastTime
+		if dt <= 0 then return end
+
+		local state = humanoid:GetState()
+		local exempt = state == Enum.HumanoidStateType.Seated
+			or state == Enum.HumanoidStateType.Swimming
+			or state == Enum.HumanoidStateType.Climbing
+			or state == Enum.HumanoidStateType.Physics
+			or state == Enum.HumanoidStateType.Ragdoll
+
+		local currentPos = root.Position
+		local moveVec = currentPos - lastPos
+		local horizontalDist = Vector3.new(moveVec.X, 0, moveVec.Z).Magnitude
+		local horizontalSpeed = horizontalDist / dt
+
+		if not exempt and humanoid.MoveDirection.Magnitude > 0.1
+			and horizontalSpeed > (MAX_WALKSPEED + SPEED_BUFFER) then
+			punishPlayer(player, KICK_MESSAGE .. " (Speed)")
+			heartbeatConn:Disconnect()
+			return
+		end
+
+		if moveVec.Magnitude > MAX_TELEPORT_DIST then
+			punishPlayer(player, KICK_MESSAGE .. " (Teleport)")
+			heartbeatConn:Disconnect()
+			return
+		end
+
+		if not exempt and moveVec.Magnitude > 0.1 then
+			local rayParams = RaycastParams.new()
+			rayParams.FilterDescendantsInstances = { character }
+			rayParams.FilterType = Enum.RaycastFilterType.Exclude
+
+			local result = workspace:Raycast(lastPos, moveVec, rayParams)
+			if result and result.Instance and result.Instance.CanCollide then
+				noclipCount += 1
+				root.CFrame = CFrame.new(lastPos)
+				if noclipCount >= MAX_NOCLIP_ATTEMPTS then
+					punishPlayer(player, KICK_MESSAGE .. " (Noclip)")
+					heartbeatConn:Disconnect()
+					return
+				end
+			else
+				lastPos = currentPos
+			end
+		else
+			lastPos = currentPos
+		end
+
+		lastTime = now
+	end)
+
+	task.spawn(function()
+		local airTimeCounter = 0
+
+		while character.Parent and root.Parent do
+			task.wait(AIR_CHECK_INTERVAL)
+			if not root.Parent or humanoid.Health <= 0 then break end
+
+			local state = humanoid:GetState()
+			local exempt = state == Enum.HumanoidStateType.Seated
+				or state == Enum.HumanoidStateType.Swimming
+				or state == Enum.HumanoidStateType.Climbing
+				or state == Enum.HumanoidStateType.Physics
+				or state == Enum.HumanoidStateType.Ragdoll
+
+			if exempt then
+				airTimeCounter = 0
+			else
+				local yVelocity = root.AssemblyLinearVelocity.Y
+
+				local rayParams = RaycastParams.new()
+				rayParams.FilterDescendantsInstances = { character }
+				rayParams.FilterType = Enum.RaycastFilterType.Exclude
+				local groundResult = workspace:Raycast(root.Position, Vector3.new(0, -GROUND_RAY_DISTANCE, 0), rayParams)
+				local isNearGround = groundResult ~= nil
+
+				if not isNearGround and yVelocity >= -1 then
+					airTimeCounter += AIR_CHECK_INTERVAL
+					if airTimeCounter > MAX_AIR_TIME then
+						punishPlayer(player, KICK_MESSAGE .. " (Flying)")
+						break
+					end
+				elseif yVelocity > MAX_UPWARD_VELOCITY then
+					punishPlayer(player, KICK_MESSAGE .. " (Velocity Spike)")
+					break
+				else
+					airTimeCounter = 0
+				end
+			end
+		end
+	end)
+
+	task.spawn(function()
+		local lastHealth = humanoid.Health
+		local lastCheckTime = os.clock()
+		local violations = 0
+
+		while character.Parent and root.Parent do
+			task.wait(1)
+			if humanoid.Health <= 0 then break end
+
+			local now = os.clock()
+			local dt = now - lastCheckTime
+			local healthDelta = humanoid.Health - lastHealth
+
+			if dt > 0 and healthDelta > 0 then
+				local regenRate = healthDelta / dt
+				if regenRate > MAX_HEALTH_REGEN_PER_SEC then
+					violations += 1
+					if violations >= REGEN_VIOLATIONS_LIMIT then
+						punishPlayer(player, KICK_MESSAGE .. " (Health Regen)")
+						break
+					end
+				else
+					violations = math.max(0, violations - 1)
+				end
+			end
+
+			lastHealth = humanoid.Health
+			lastCheckTime = now
+		end
+	end)
+
+	character.AncestorRemoved:Connect(function()
+		if heartbeatConn then heartbeatConn:Disconnect() end
+		for _, conn in ipairs(statConns) do
+			conn:Disconnect()
+		end
+	end)
+end
+
+Players.PlayerAdded:Connect(function(player)
+	player.CharacterAdded:Connect(function(character)
+		watch(player, character)
+	end)
+end)
+
+for _, player in ipairs(Players:GetPlayers()) do
+	if player.Character then
+		watch(player, player.Character)
+	end
+	player.CharacterAdded:Connect(function(character)
+		watch(player, character)
+	end)
+end
