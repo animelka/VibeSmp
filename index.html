@@ -15,7 +15,6 @@ local WHITELISTED_IDS = {
 local MAX_WALKSPEED     = 18
 local MAX_JUMPPOWER     = 50
 local MAX_JUMPHEIGHT    = 7.5
-local SPEED_BUFFER      = 6
 
 local MAX_TELEPORT_DIST     = 50
 local MAX_NOCLIP_ATTEMPTS   = 3
@@ -150,15 +149,6 @@ local function watch(player, character)
 
 		local currentPos = root.Position
 		local moveVec = currentPos - lastPos
-		local horizontalDist = Vector3.new(moveVec.X, 0, moveVec.Z).Magnitude
-		local horizontalSpeed = horizontalDist / dt
-
-		if not exempt and humanoid.MoveDirection.Magnitude > 0.1
-			and horizontalSpeed > (MAX_WALKSPEED + SPEED_BUFFER) then
-			punishPlayer(player, KICK_MESSAGE .. " (Speed)")
-			heartbeatConn:Disconnect()
-			return
-		end
 
 		if moveVec.Magnitude > MAX_TELEPORT_DIST then
 			punishPlayer(player, KICK_MESSAGE .. " (Teleport)")
